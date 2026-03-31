@@ -1,17 +1,23 @@
 // Google Apps Script prototype for a Sheets sidebar that evaluates call transcripts
 // from an uploaded CSV sent directly from the sidebar.
 //
-// Updated per Ashley comments:
-// - Removes follow-up criterion
-// - Removes settlement-entry criterion
-// - Removes payment-plan setup/edit criterion
-// - Removes settlement negotiation criterion
-// - Contact info criterion is N/A for unauthorized third-party calls
-// - Creditor reporting timeline only applies when debt is actually being fully resolved
-// - Badge number gets credit if opening is cut off / recording starts mid-call
-// - Company-name disclosure criterion will not fail if borrower explicitly asks who is calling
-// - Call recap is N/A if borrower disconnects early
-// - Scorecard links now contain ALL calls for each FIRST_NAME, not just one row
+// Key updates:
+// - Reduced storage-heavy progress updates
+// - Bilingual English/Spanish optimization
+// - Inbound: do NOT evaluate C5 (Mini Miranda), C6 (recording disclosure), C10 (UDAAP)
+// - Outbound: do NOT evaluate C13 (UDAAP)
+// - Settlement disclosure only applies when settlement is actually accepted/applied in the transcript
+// - Outbound recording disclosure may occur anytime early in the call
+// - Outbound Mini Miranda must occur after borrower authentication
+// - Borrower authentication = first/last name + 2 pieces of PII (last 4 SSN, DOB, or physical address)
+// - Simplified disclosure checks:
+//   * Badge number satisfied if transcript mentions agent/badge number like "53"
+//   * Mini Miranda satisfied if transcript mentions "debt collector" (or Spanish equivalent)
+//   * Recording disclosure satisfied if transcript mentions "call is recorded" (or Spanish equivalent)
+// - If transcript appears cut off, later criteria are set to N/A and score is weighted off evaluated criteria only
+// - Errors note transcript cut off
+// - Scorecard links point to sheets containing all calls for each FIRST_NAME in the run
+// - Scorecard sheets also include all Verdict and Evidence columns
 
 const OUTPUT_SHEET_NAME = 'QA Evaluations';
 const PROGRESS_KEY = 'JAN_QA_PROGRESS';
@@ -19,6 +25,9 @@ const DEFAULT_MODEL = 'claude-sonnet-4-6';
 const ROW_BATCH_WRITE_SIZE = 10;
 const SLEEP_MS_BETWEEN_ROWS = 150;
 const SCORECARD_FOLDER_ID = '1VV7lo0p0qLUgIdwWgqdZ57k-co8W0vXE';
+
+const PROGRESS_WRITE_EVERY_N_ROWS = 5;
+const PROGRESS_WRITE_MIN_INTERVAL_MS = 4000;
 
 const STIPULATION_COMPANIES = [
   'Baxter Credit Union',
@@ -50,7 +59,8 @@ function getProgress() {
       written: 0,
       skipped: 0,
       percent: 0,
-      message: 'Ready.'
+      message: 'Ready.',
+      updatedAt: ''
     };
   }
 
@@ -105,8 +115,10 @@ function runEvaluations(options) {
   let skipped = 0;
   let pendingRows = [];
   const scorecardGroups = {};
+  let progressState = createProgressState_();
 
-  setProgress_({
+  setProgressThrottled_(progressState, {
+    force: true,
     status: 'running',
     fileName: options.fileName,
     total: total,
@@ -121,22 +133,11 @@ function runEvaluations(options) {
     const csvRowIndex = eligibleIndexes[k];
     const row = rows[csvRowIndex];
 
-    setProgress_({
-      status: 'running',
-      fileName: options.fileName,
-      total: total,
-      processed: processed,
-      written: written,
-      skipped: skipped,
-      errors: errors.slice(-10),
-      message: `Evaluating row ${k + 1} of ${total}...`
-    });
-
     try {
       const rowCtx = buildRowContext_(row, idx);
       const prompt = buildEvaluationPrompt_(rowCtx);
       const responseText = callClaudeSingle_(prompt);
-      const parsed = parseModelJsonSafe_(responseText, prompt, rowCtx);
+      const parsed = parseModelJsonSafe_(responseText, rowCtx);
       const normalized = normalizeEvaluationsForRow_(parsed, rowCtx);
       const cltParsed = parseClt_(row[idx.CLT]);
 
@@ -199,7 +200,7 @@ function runEvaluations(options) {
       }
     }
 
-    setProgress_({
+    setProgressThrottled_(progressState, {
       status: 'running',
       fileName: options.fileName,
       total: total,
@@ -229,7 +230,8 @@ function runEvaluations(options) {
     errors: errors
   };
 
-  setProgress_({
+  setProgressThrottled_(progressState, {
+    force: true,
     status: 'done',
     fileName: options.fileName,
     total: total,
@@ -302,15 +304,40 @@ function buildEvaluationPrompt_(rowCtx) {
     ? 'Borrower is a New York resident. Preferred-language criterion must be Yes or No based on transcript evidence if that criterion exists for this direction.'
     : 'Borrower is not a New York resident. Preferred-language criterion should be N/A unless language preference was explicitly discussed.';
 
-  const ashleyRules = [
-    'Ashley QA rules:',
-    '- Creditor reporting timeline is ONLY applicable if the borrower is making a full one-time resolution payment / debt is being fully resolved.',
+  const bilingualInstructions = rowCtx.language === 'Spanish'
+    ? [
+        'This transcript is likely in Spanish.',
+        'Evaluate the call using Spanish transcript evidence when present.',
+        'Recognize Spanish equivalents of required disclosures, authentication, settlement language, recording disclosure, payment terms, dispute language, badge number, and transfer language.',
+        'Return verdicts in English as Yes, No, or N/A.',
+        'Evidence may quote or paraphrase Spanish.'
+      ].join('\n')
+    : [
+        'This transcript is likely in English.',
+        'Evaluate using English transcript evidence.'
+      ].join('\n');
+
+  const rules = [
+    'QA rules:',
+    '- Be somewhat liberal rather than conservative when evaluating evidence.',
+    '- Give reasonable benefit of the doubt when transcript evidence strongly suggests compliance.',
+    '- For inbound calls, do NOT evaluate Mini Miranda, call recording disclosure, or UDAAP.',
+    '- For outbound calls, do NOT evaluate UDAAP.',
+    '- Settlement disclosure applies ONLY when settlement is actually accepted, applied, or finalized in the transcript.',
+    '- For outbound recording disclosure, order does not matter as long as it appears early in the call.',
+    '- For outbound Mini Miranda, it must be provided only after borrower authentication.',
+    '- Borrower authentication means first or last name PLUS 2 pieces of PII: last 4 SSN, DOB, or physical address.',
+    '- Badge number criterion is satisfied if the transcript mentions an agent or badge number like "53", "badge 53", or similar.',
+    '- Mini Miranda criterion is satisfied if the transcript mentions "debt collector" or a Spanish equivalent.',
+    '- Call recording disclosure criterion is satisfied if the transcript mentions "call is recorded" or a Spanish equivalent.',
     '- Do NOT fail the company-name disclosure criterion if the borrower explicitly asked who was calling.',
-    '- Do NOT fail the badge-number criterion if the opening of the recording appears cut off or starts mid-call.',
     '- If the call is with an unauthorized third party, contact info confirmation/update can be N/A.',
     '- If the borrower disconnects early, recap/summary and later wrap-up items can be N/A.',
-    '- Mini-Miranda / collection disclosure does not have to happen in one specific order unless the criterion explicitly says it must.',
-    '- Removed criteria should not be invented or evaluated.'
+    '- If transcript appears cut off, do not evaluate later criteria that cannot be fairly assessed.',
+    '- Settlement disclosure script should match one of these concepts:',
+    '  1) Automatic approval: If the full negotiated payment amount is not received within the agreed timeframe or is returned unpaid, the agreement is void and a new agreement must be reached.',
+    '  2) Approval required: If the request is approved, payment must be set up within 30 days, and if the full negotiated payment amount is not received within the agreed timeframe or is returned unpaid, the agreement is void and a new agreement must be reached.',
+    '- Use only the criteria listed below. Do not invent extra criteria.'
   ].join('\n');
 
   return [
@@ -323,7 +350,8 @@ function buildEvaluationPrompt_(rowCtx) {
     '- Evidence: ONE concise quote or paraphrase from the transcript supporting the verdict',
     '',
     'Rules:',
-    '- Be conservative.',
+    '- Be somewhat liberal rather than conservative.',
+    '- If evidence is strongly suggestive, you may mark Yes.',
     '- If evidence is missing, mark No or N/A.',
     '- Evidence must come directly from the transcript.',
     '- Evidence must be short, maximum one sentence.',
@@ -331,6 +359,7 @@ function buildEvaluationPrompt_(rowCtx) {
     '- Identify the agent name from the transcript if possible, otherwise use Unknown.',
     '- Do not evaluate deleted criteria.',
     '- For criteria marked not applicable, return N/A.',
+    '- For order-sensitive checks, evaluate sequence carefully.',
     '',
     `Call direction: ${rowCtx.direction}`,
     `Borrower state: ${rowCtx.addressState || 'Unknown'}`,
@@ -340,7 +369,9 @@ function buildEvaluationPrompt_(rowCtx) {
     `Language detected: ${rowCtx.language}`,
     stateRule,
     '',
-    ashleyRules,
+    bilingualInstructions,
+    '',
+    rules,
     '',
     'Criteria to score:',
     rubric,
@@ -367,8 +398,8 @@ function normalizeEvaluationsForRow_(model, rowCtx) {
 
   const normalizedEvaluations = criteria.map(function(c) {
     const raw = byId[String(c.id)] || {};
-    const verdict = c.applicable ? normalizeVerdict_(raw.verdict || 'No') : 'N/A';
-    const evidence = c.applicable ? String(raw.evidence || '') : c.naReason;
+    let verdict = c.applicable ? normalizeVerdict_(raw.verdict || 'No') : 'N/A';
+    let evidence = c.applicable ? String(raw.evidence || '') : c.naReason;
 
     return {
       id: c.id,
@@ -378,22 +409,8 @@ function normalizeEvaluationsForRow_(model, rowCtx) {
     };
   });
 
-  // Ashley override: if opening is cut off, give badge-number credit.
-  const badgeId = rowCtx.direction === 'INBOUND' ? 29 : 31;
-  const badgeEval = normalizedEvaluations.filter(function(ev) { return ev.id === badgeId; })[0];
-  if (badgeEval && openingLooksCutOff_(rowCtx.transcript)) {
-    badgeEval.verdict = 'Yes';
-    badgeEval.evidence = 'Opening portion of recording appears cut off; badge number treated as satisfied per QA rule.';
-  }
-
-  // Ashley override: if borrower explicitly asked who was calling, do not fail company-name disclosure order.
-  if (rowCtx.direction === 'OUTBOUND' && rowCtx.flags.askedWhoCalling) {
-    const companyDisclosure = normalizedEvaluations.filter(function(ev) { return ev.id === 12; })[0];
-    if (companyDisclosure) {
-      companyDisclosure.verdict = 'Yes';
-      companyDisclosure.evidence = 'Borrower explicitly asked who was calling, so company disclosure order exception applies.';
-    }
-  }
+  applyHardRuleOverrides_(normalizedEvaluations, rowCtx);
+  applyCutoffBenefitOfDoubt_(normalizedEvaluations, rowCtx);
 
   const applicable = normalizedEvaluations.filter(function(ev) {
     return ev.verdict !== 'N/A';
@@ -410,10 +427,94 @@ function normalizeEvaluationsForRow_(model, rowCtx) {
   return {
     agent_name: model.agent_name || 'Unknown',
     summary: model.summary || '',
-    errors: buildErrorsText_(normalizedEvaluations),
+    errors: buildErrorsText_(normalizedEvaluations, rowCtx),
     final_score: finalScore,
     evaluations: normalizedEvaluations
   };
+}
+
+function applyHardRuleOverrides_(evaluations, rowCtx) {
+  const byId = {};
+  evaluations.forEach(function(ev) {
+    byId[String(ev.id)] = ev;
+  });
+
+  const badgeId = rowCtx.direction === 'INBOUND' ? '29' : '31';
+  if (byId[badgeId] && rowCtx.flags.hasBadgeNumberMention) {
+    byId[badgeId].verdict = 'Yes';
+    byId[badgeId].evidence = 'Transcript includes an agent or badge number reference.';
+  }
+
+  if (rowCtx.direction === 'OUTBOUND' && byId['12'] && rowCtx.flags.askedWhoCalling) {
+    byId['12'].verdict = 'Yes';
+    byId['12'].evidence = 'Borrower explicitly asked who was calling, so company disclosure order exception applies.';
+  }
+
+  if (rowCtx.direction === 'OUTBOUND' && byId['5']) {
+    if (rowCtx.flags.hasRecordingDisclosureEarly && rowCtx.flags.hasMiniMirandaAfterAuth) {
+      byId['5'].verdict = 'Yes';
+      byId['5'].evidence = 'Recording disclosure was stated early in the call and debt-collector language appeared after borrower authentication.';
+    } else {
+      byId['5'].verdict = 'No';
+      byId['5'].evidence = buildOutboundC5Evidence_(rowCtx);
+    }
+  }
+
+  const settlementId = rowCtx.direction === 'INBOUND' ? '7' : '9';
+  if (byId[settlementId]) {
+    if (!rowCtx.flags.settlementAcceptedOrApplied) {
+      byId[settlementId].verdict = 'N/A';
+      byId[settlementId].evidence = 'Not evaluated because settlement was not accepted or applied in the transcript.';
+    } else if (rowCtx.flags.hasValidSettlementDisclosure) {
+      byId[settlementId].verdict = 'Yes';
+      byId[settlementId].evidence = 'Settlement disclosure language was provided when settlement was accepted or applied.';
+    } else {
+      byId[settlementId].verdict = 'No';
+      byId[settlementId].evidence = 'Settlement was accepted or applied, but the required settlement disclosure language was not clearly stated.';
+    }
+  }
+
+  const contactId = rowCtx.direction === 'INBOUND' ? '11' : '14';
+  if (byId[contactId] && rowCtx.flags.unauthorizedThirdParty) {
+    byId[contactId].verdict = 'N/A';
+    byId[contactId].evidence = 'Not evaluated because this was an unauthorized third-party call.';
+  }
+
+  const recapId = rowCtx.direction === 'INBOUND' ? '26' : '27';
+  if (byId[recapId] && rowCtx.flags.borrowerDisconnectedEarly) {
+    byId[recapId].verdict = 'N/A';
+    byId[recapId].evidence = 'Not evaluated because borrower disconnected early.';
+  }
+}
+
+function applyCutoffBenefitOfDoubt_(evaluations, rowCtx) {
+  if (!rowCtx.flags.transcriptAppearsCutOff) return;
+
+  const keepIds = getKeepCriteriaForCutoff_(rowCtx.direction);
+
+  evaluations.forEach(function(ev) {
+    if (keepIds.indexOf(ev.id) === -1) {
+      ev.verdict = 'N/A';
+      ev.evidence = 'Not evaluated because transcript appears cut off.';
+    }
+  });
+}
+
+function getKeepCriteriaForCutoff_(direction) {
+  if (direction === 'INBOUND') {
+    return [1, 2, 3, 4, 8, 9, 11, 12, 13, 16, 21, 22, 25, 27, 28, 29];
+  }
+  return [1, 2, 4, 5, 6, 7, 8, 10, 11, 12, 14, 15, 18, 22, 28, 29, 30, 31];
+}
+
+function buildOutboundC5Evidence_(rowCtx) {
+  if (!rowCtx.flags.hasRecordingDisclosureEarly && !rowCtx.flags.hasMiniMirandaAfterAuth) {
+    return 'Required early recording disclosure and post-authentication debt-collector language were not both clearly present.';
+  }
+  if (!rowCtx.flags.hasRecordingDisclosureEarly) {
+    return 'Recording disclosure like "this call is recorded" was not clearly stated early in the call.';
+  }
+  return 'Debt-collector language was not clearly stated after borrower authentication.';
 }
 
 function buildWideOutputRow_(model, meta) {
@@ -458,18 +559,39 @@ function buildWideOutputRow_(model, meta) {
   return row;
 }
 
-function writeOutputHeader_(sheet) {
-  const headers = [
-    'UUID', 'FIRST_NAME', 'AGENT_UUID', 'Direction', 'Agent', 'Evaluator', 'Date of Survey', 'Date', 'Time',
-    'Language', 'ACCOUNT_NUMBER', 'AP Portal', 'Comm Channel', 'Created At', 'Call Comm UUID', 'Original Creditor',
-    'Company Name', 'Address State', 'Final Score', 'Summary', 'Errors', 'Scorecard'
+function buildScorecardRecord_(model, meta) {
+  const evaluations = Array.isArray(model.evaluations) ? model.evaluations : [];
+  const byId = {};
+
+  evaluations.forEach(function(ev) {
+    byId[String(ev.id)] = ev;
+  });
+
+  const row = [
+    meta.uuid || '',
+    meta.firstName || '',
+    meta.agentUuid || '',
+    meta.direction || '',
+    meta.createdAt || '',
+    meta.clt || '',
+    meta.apPortal || '',
+    Number(meta.finalScore || 0),
+    meta.summary || '',
+    meta.errors || '',
+    ''
   ];
 
   getUnifiedCriteriaList_().forEach(function(c) {
-    headers.push(`C${c.id} Verdict`);
-    headers.push(`C${c.id} Evidence`);
+    const ev = byId[String(c.id)] || {};
+    row.push(ev.verdict || '');
+    row.push(String(ev.evidence || ''));
   });
 
+  return row;
+}
+
+function writeOutputHeader_(sheet) {
+  const headers = buildExpectedHeaders_();
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
 }
 
@@ -537,27 +659,47 @@ function buildRowContext_(row, idx) {
 }
 
 function deriveCallFlags_(transcript, callCode, companyName, isOosRaw, status) {
-  const t = String(transcript || '').toLowerCase();
+  const t = String(transcript || '');
   const code = String(callCode || '').toLowerCase();
   const isOos = String(isOosRaw || '').toUpperCase() === 'OOS';
-  const isPaid = /\bpaid\b|paid in full|resolved|zero balance/i.test(status) || /paid in full|resolved your debt|zero balance/i.test(t);
+  const normalizedCompany = normalizeCompanyName_(companyName);
 
-  const hasThirdPartyJoin = /(new[, ]+third party|third party joined|joined the call|someone else('|’)s debit card|someone else('|’)s card|authorized to participate on a call)/i.test(t);
-  const unauthorizedThirdParty = /(calling on behalf of|on behalf of someone else|not authorized|unauthorized third party|i am her husband|i am his wife|power of attorney|poa)/i.test(t);
-  const paymentMade = /(payment (was )?successfully processed|processing that now|do i have your authorization to proceed with this payment|making a payment of|partial payment of|card ending in|authorization to proceed)/i.test(t);
-  const paymentInfoGiven = /(card ending in|debit card|authorization to proceed with this payment|payment method|draft from|using your card ending in|routing number|account number)/i.test(t);
-  const settlementRequested = /(settlement|settle|reduced amount|reduction|offer of|negotiat)/i.test(t) || code === 'settlement';
-  const settlementOffer = /(offer of|approve an offer|counter offer|new balance is|settlement amount|apply that offer)/i.test(t) || code === 'settlement';
-  const disputeDiscussed = /(dispute|fraud|identity theft|not responsible|do not recognize this debt)/i.test(t) || code === 'dispute';
-  const oneTimePaymentDiscussed = /(one[- ]time payment|one time payment|pay today|make a payment today|single payment|lump sum)/i.test(t);
-  const paymentPlanDiscussed = /(payment plan|monthly payment|draft each month|draft each week|reoccurring payments|recurring payments|schedule it out)/i.test(t);
-  const companyRequiresClientSpecificDispute = companyRequiresSpecificCompanyRule_(companyName);
-  const companyRequiresStipulation = companyRequiresSpecificCompanyRule_(companyName);
-  const aboutSettlement = settlementRequested || settlementOffer;
-  const resolvedPayment = /(paid in full|full negotiated payment amount|resolve the account|resolved account|settled in full|full payment|one-time resolution)/i.test(t);
-  const transferOccurred = /(transfer you|connect you with|direct your call|specialist|transferred)/i.test(t);
-  const askedWhoCalling = /(who is this|who's calling|who am i speaking with|what company is this|who called me)/i.test(t);
-  const borrowerDisconnectedEarly = /(call dropped|disconnect|disconnected|hang up|hung up|line went dead)/i.test(t);
+  const patterns = {
+    paymentMade: /(payment (was )?successfully processed|processing that now|authorization to proceed with this payment|making a payment of|partial payment of|card ending in|routing number|account number|pago procesado|autoriza el pago|procesar el pago|haciendo un pago|pago parcial|tarjeta terminando en|número de ruta|número de cuenta)/i,
+    paymentInfoGiven: /(card ending in|debit card|payment method|draft from|routing number|account number|tarjeta terminando en|tarjeta de débito|método de pago|número de ruta|número de cuenta)/i,
+    settlementRequested: /(settlement|settle|reduced amount|reduction|offer of|negotiat|resolver la cuenta|liquidar|acuerdo|oferta de liquidación|reducir el saldo|negociar)/i,
+    settlementAcceptedOrApplied: /(i accept|accepted the settlement|we can do that settlement|let's move forward with the settlement|apply the settlement|set up that settlement|approved settlement|i will take the offer|agree to the settlement|acepto|acepta la oferta|vamos a hacer ese acuerdo|aplicar el acuerdo|liquidación aprobada|tomaré la oferta|de acuerdo con la liquidación|payment of the settlement amount|pago del monto de liquidación)/i,
+    disputeDiscussed: /(dispute|fraud|identity theft|not responsible|do not recognize this debt|disputa|fraude|robo de identidad|no reconozco esta deuda|no soy responsable)/i,
+    oneTimePaymentDiscussed: /(one[- ]time payment|one time payment|pay today|make a payment today|single payment|lump sum|pago único|pagar hoy|pago hoy|un solo pago)/i,
+    paymentPlanDiscussed: /(payment plan|monthly payment|draft each month|draft each week|reoccurring payments|recurring payments|schedule it out|plan de pagos|pago mensual|pagos recurrentes|programar pagos)/i,
+    transferOccurred: /(transfer you|connect you with|direct your call|specialist|transferred|transferir|transferencia|conectarlo con|especialista|lo transfiero)/i,
+    askedWhoCalling: /(who is this|who's calling|who am i speaking with|what company is this|who called me|quién habla|quién llama|de qué compañía llama|quién me llama)/i,
+    borrowerDisconnectedEarly: /(call dropped|disconnect|disconnected|hang up|hung up|line went dead|se cortó la llamada|se desconectó|colgó|la línea se cayó)/i,
+    unauthorizedThirdParty: /(calling on behalf of|on behalf of someone else|not authorized|unauthorized third party|i am her husband|i am his wife|power of attorney|poa|llamo de parte de|no autorizado|tercero no autorizado|soy su esposo|soy su esposa|poder legal)/i,
+    paidResolved: /(paid in full|resolved|zero balance|settled in full|resolve the account|full payment|one-time resolution|pagado en su totalidad|saldo cero|resuelto|liquidado en su totalidad)/i
+  };
+
+  const paymentMade = patterns.paymentMade.test(t);
+  const paymentInfoGiven = patterns.paymentInfoGiven.test(t);
+  const settlementRequested = patterns.settlementRequested.test(t) || code === 'settlement';
+  const settlementAcceptedOrApplied = patterns.settlementAcceptedOrApplied.test(t);
+  const disputeDiscussed = patterns.disputeDiscussed.test(t) || code === 'dispute';
+  const oneTimePaymentDiscussed = patterns.oneTimePaymentDiscussed.test(t);
+  const paymentPlanDiscussed = patterns.paymentPlanDiscussed.test(t);
+  const transferOccurred = patterns.transferOccurred.test(t);
+  const askedWhoCalling = patterns.askedWhoCalling.test(t);
+  const borrowerDisconnectedEarly = patterns.borrowerDisconnectedEarly.test(t);
+  const unauthorizedThirdParty = patterns.unauthorizedThirdParty.test(t);
+  const isPaid = patterns.paidResolved.test(status) || patterns.paidResolved.test(t);
+  const resolvedPayment = /(paid in full|full negotiated payment amount|resolve the account|resolved account|settled in full|full payment|one-time resolution|pagado en su totalidad|monto negociado completo|resolver la cuenta|liquidado en su totalidad)/i.test(t);
+  const hasThirdPartyJoin = /(new[, ]+third party|third party joined|joined the call|someone else('|’)s debit card|someone else('|’)s card|authorized to participate on a call|tercero se unió|otra persona se unió|alguien más se unió)/i.test(t);
+
+  const authenticationAnalysis = detectAuthenticationSequence_(t);
+  const hasRecordingDisclosureEarly = detectEarlyRecordingDisclosure_(t);
+  const hasMiniMirandaAfterAuth = detectMiniMirandaAfterAuthentication_(t, authenticationAnalysis.authEndIndex);
+  const hasValidSettlementDisclosure = detectSettlementDisclosure_(t);
+  const hasBadgeNumberMention = detectBadgeNumberMention_(t);
+  const transcriptAppearsCutOff = detectTranscriptCutoff_(t);
 
   return {
     hasThirdPartyJoin: hasThirdPartyJoin,
@@ -565,25 +707,35 @@ function deriveCallFlags_(transcript, callCode, companyName, isOosRaw, status) {
     paymentMade: paymentMade,
     paymentInfoGiven: paymentInfoGiven,
     settlementRequested: settlementRequested,
-    settlementOffer: settlementOffer,
+    settlementAcceptedOrApplied: settlementAcceptedOrApplied,
     disputeDiscussed: disputeDiscussed,
     oneTimePaymentDiscussed: oneTimePaymentDiscussed,
     paymentPlanDiscussed: paymentPlanDiscussed,
-    companyRequiresClientSpecificDispute: companyRequiresClientSpecificDispute,
-    companyRequiresStipulation: companyRequiresStipulation,
-    aboutSettlement: aboutSettlement,
+    companyRequiresClientSpecificDispute: companyRequiresClientSpecificDispute_(normalizedCompany),
+    companyRequiresStipulation: companyRequiresStipulation_(normalizedCompany),
+    aboutSettlement: settlementAcceptedOrApplied,
     isPaid: isPaid,
     isOos: isOos,
     resolvedPayment: resolvedPayment,
     transferOccurred: transferOccurred,
     askedWhoCalling: askedWhoCalling,
-    borrowerDisconnectedEarly: borrowerDisconnectedEarly
+    borrowerDisconnectedEarly: borrowerDisconnectedEarly,
+    hasRecordingDisclosureEarly: hasRecordingDisclosureEarly,
+    hasMiniMirandaAfterAuth: hasMiniMirandaAfterAuth,
+    hasValidSettlementDisclosure: hasValidSettlementDisclosure,
+    hasBadgeNumberMention: hasBadgeNumberMention,
+    authSatisfied: authenticationAnalysis.authSatisfied,
+    authEndIndex: authenticationAnalysis.authEndIndex,
+    transcriptAppearsCutOff: transcriptAppearsCutOff
   };
 }
 
-function companyRequiresSpecificCompanyRule_(companyName) {
-  const normalized = normalizeCompanyName_(companyName);
-  return STIPULATION_COMPANIES.map(normalizeCompanyName_).indexOf(normalized) !== -1;
+function companyRequiresClientSpecificDispute_(normalizedCompany) {
+  return normalizedCompany === 'klarna' || normalizedCompany === 'cavalry portfolio services, llc';
+}
+
+function companyRequiresStipulation_(normalizedCompany) {
+  return STIPULATION_COMPANIES.map(normalizeCompanyName_).indexOf(normalizedCompany) !== -1;
 }
 
 function normalizeCompanyName_(value) {
@@ -595,16 +747,16 @@ function getCriteriaForRow_(rowCtx) {
 
   if (rowCtx.direction === 'INBOUND') {
     return [
-      crit_(1, 'Agent authenticated the account by requesting at least two identifiers from the borrower (DOB, last 4 SSN, address, or login PIN).', true),
+      crit_(1, 'Agent authenticated the account by requesting first or last name plus 2 pieces of PII (last 4 SSN, DOB, or physical address).', true),
       crit_(2, 'Agent stated the original and current creditor, last 4 of account number, description of debt, and current balance.', true),
       crit_(3, 'Agent did not use discriminatory language or behavior.', true),
       crit_(4, 'Agent followed payment compliance guidelines, including required third-party authorization when applicable.', flags.paymentMade, 'Not evaluated because no payment activity occurred.'),
-      crit_(5, 'Agent provided the Mini-Miranda / collection disclosure.', true),
-      crit_(6, 'Agent provided the recording disclosure if a new third party joined the call.', flags.hasThirdPartyJoin, 'Not evaluated because no new third party joined the call.'),
-      crit_(7, 'Agent provided the settlement disclosure.', flags.aboutSettlement, 'Not evaluated because the call was not about a settlement.'),
-      crit_(8, 'Agent confirmed or updated the borrower preferred language for a New York resident.', rowCtx.addressState === 'NY', 'Not evaluated because borrower is not a New York resident.'),
+      crit_(5, 'Mini Miranda / debt collector disclosure.', false, 'Not evaluated for inbound calls.'),
+      crit_(6, 'Recording disclosure when new third party joined.', false, 'Not evaluated for inbound calls.'),
+      crit_(7, 'Agent provided the settlement disclosure when settlement was accepted or applied.', flags.settlementAcceptedOrApplied, 'Not evaluated because settlement was not accepted or applied in the transcript.'),
+      crit_(8, 'Agent confirmed or updated borrower preferred language for a New York resident.', rowCtx.addressState === 'NY', 'Not evaluated because borrower is not a New York resident.'),
       crit_(9, 'Agent provided the OOS disclosure.', rowCtx.isOos, 'Not evaluated because IS_OOS is not OOS.'),
-      crit_(10, 'Agent addressed borrower questions and concerns fully and factually without UDAAP risk.', true),
+      crit_(10, 'UDAAP risk evaluation.', false, 'Not evaluated for inbound calls.'),
       crit_(11, 'Agent confirmed or updated borrower contact info (phone, email, address).', !flags.unauthorizedThirdParty, 'Not evaluated because this was an unauthorized third-party call.'),
       crit_(12, 'Agent demonstrated call control.', true),
       crit_(13, 'Agent was personable and expressed empathy.', true),
@@ -614,38 +766,38 @@ function getCriteriaForRow_(rowCtx) {
       crit_(25, 'Agent provided January timetable for reporting a resolved account to the creditor.', flags.resolvedPayment, 'Not evaluated because the debt was not being fully resolved on this call.'),
       crit_(26, 'Agent provided a recap or summary of the call.', !flags.borrowerDisconnectedEarly, 'Not evaluated because borrower disconnected early.'),
       crit_(27, 'Agent correctly addressed a Klarna or Cavalry dispute.', flags.companyRequiresClientSpecificDispute && flags.disputeDiscussed, 'Not evaluated because this was not a Klarna/Cavalry dispute call.'),
-      crit_(28, 'Agent informed borrower of BCU, RBFCU, or Flexible Finance stipulation prior to offering a settlement.', flags.companyRequiresStipulation && flags.aboutSettlement, 'Not evaluated because stipulation did not apply.'),
+      crit_(28, 'Agent informed borrower of BCU, RBFCU, or Flexible Finance stipulation prior to offering settlement.', flags.companyRequiresStipulation && flags.settlementAcceptedOrApplied, 'Not evaluated because stipulation did not apply.'),
       crit_(29, 'Agent stated their badge number.', true),
       crit_(32, 'Agent transferred the call or account to the appropriate party when needed.', flags.transferOccurred, 'Not evaluated because no transfer occurred.')
     ];
   }
 
   return [
-    crit_(1, 'Agent authenticated the account by requesting at least two identifiers from the borrower (DOB, last 4 SSN, address, or login PIN).', true),
+    crit_(1, 'Agent authenticated the account by requesting first or last name plus 2 pieces of PII (last 4 SSN, DOB, or physical address).', true),
     crit_(2, 'Agent stated the original and current creditor, last 4 of account number, description of debt, and current balance.', true),
     crit_(4, 'Agent did not use discriminatory language or behavior.', true),
-    crit_(5, 'Agent recited Mini-Miranda and recording disclosure before providing account information.', true),
+    crit_(5, 'Agent gave call recording disclosure early in the call and provided debt-collector language after borrower authentication.', true),
     crit_(6, 'Agent did not disclose the purpose of the call or leave a message with an unauthorized third party.', true),
     crit_(7, 'Agent followed payment compliance guidelines, including payment plan disclosure and EFTA compliance when applicable.', flags.paymentMade || flags.paymentPlanDiscussed, 'Not evaluated because no payment or payment-plan activity occurred.'),
     crit_(8, 'Agent provided the OOS disclosure.', rowCtx.isOos, 'Not evaluated because IS_OOS is not OOS.'),
-    crit_(9, 'Agent provided the settlement disclosure.', flags.aboutSettlement, 'Not evaluated because the call was not about a settlement.'),
-    crit_(10, 'Agent confirmed or updated the borrower preferred language for a New York resident.', rowCtx.addressState === 'NY', 'Not evaluated because borrower is not a New York resident.'),
+    crit_(9, 'Agent provided the settlement disclosure when settlement was accepted or applied.', flags.settlementAcceptedOrApplied, 'Not evaluated because settlement was not accepted or applied in the transcript.'),
+    crit_(10, 'Agent confirmed or updated borrower preferred language for a New York resident.', rowCtx.addressState === 'NY', 'Not evaluated because borrower is not a New York resident.'),
     crit_(11, 'Agent provided recording disclosure if a new third party joined the phone call.', flags.hasThirdPartyJoin, 'Not evaluated because no new third party joined the call.'),
     crit_(12, 'Agent did not disclose company name before authentication unless explicitly asked by the borrower.', true),
-    crit_(13, 'Agent addressed borrower questions and concerns fully and factually without UDAAP risk.', true),
+    crit_(13, 'UDAAP risk evaluation.', false, 'Not evaluated for outbound calls.'),
     crit_(14, 'Agent confirmed or updated borrower contact info (phone, email, address).', !flags.unauthorizedThirdParty && !flags.isPaid && !flags.isOos, 'Not evaluated because contact update was not required for this call.'),
     crit_(15, 'Agent was personable and expressed empathy or professionalism.', true),
     crit_(18, 'Agent filed a dispute under the correct category and advised borrower to send supporting documents when applicable.', flags.disputeDiscussed, 'Not evaluated because no dispute was discussed.'),
-    crit_(22, 'Agent properly ceased the account under the rightful category when required.', /(cease|cease and desist|stop calling|do not contact)/i.test(rowCtx.transcript), 'Not evaluated because no cease request occurred.'),
+    crit_(22, 'Agent properly ceased the account under the rightful category when required.', /(cease|cease and desist|stop calling|do not contact|cese|dejen de llamar|no me contacten)/i.test(rowCtx.transcript), 'Not evaluated because no cease request occurred.'),
     crit_(28, 'Agent provided January timetable for reporting a resolved account to the creditor.', flags.resolvedPayment, 'Not evaluated because the debt was not being fully resolved on this call.'),
     crit_(29, 'Agent correctly addressed a Klarna or Cavalry dispute.', flags.companyRequiresClientSpecificDispute && flags.disputeDiscussed, 'Not evaluated because this was not a Klarna/Cavalry dispute call.'),
-    crit_(30, 'Agent informed borrower of BCU, RBFCU, or Flexible Finance stipulation prior to offering a settlement.', flags.companyRequiresStipulation && flags.aboutSettlement, 'Not evaluated because stipulation did not apply.'),
+    crit_(30, 'Agent informed borrower of BCU, RBFCU, or Flexible Finance stipulation prior to offering settlement.', flags.companyRequiresStipulation && flags.settlementAcceptedOrApplied, 'Not evaluated because stipulation did not apply.'),
     crit_(31, 'Agent stated their badge number.', true),
     crit_(34, 'Agent transferred the call or account to the appropriate party when needed.', flags.transferOccurred, 'Not evaluated because no transfer occurred.')
   ];
 }
 
-function buildErrorsText_(evaluations) {
+function buildErrorsText_(evaluations, rowCtx) {
   const deficiencies = evaluations
     .filter(function(ev) { return ev.verdict === 'No'; })
     .map(function(ev) {
@@ -654,6 +806,10 @@ function buildErrorsText_(evaluations) {
         evidence ? ' — ' + evidence : ' — No supporting evidence found in transcript.'
       );
     });
+
+  if (rowCtx && rowCtx.flags && rowCtx.flags.transcriptAppearsCutOff) {
+    deficiencies.unshift('Transcript appears cut off — later criteria were not evaluated and score was weighted using only evaluated criteria.');
+  }
 
   return deficiencies.join(' | ');
 }
@@ -693,7 +849,7 @@ function parseModelJson_(text) {
   return JSON.parse(cleaned);
 }
 
-function parseModelJsonSafe_(text, originalPrompt, rowCtx) {
+function parseModelJsonSafe_(text, rowCtx) {
   try {
     return parseModelJson_(text);
   } catch (err1) {
@@ -705,7 +861,7 @@ function parseModelJsonSafe_(text, originalPrompt, rowCtx) {
     }
 
     try {
-      const repaired = repairJsonResponse_(text, originalPrompt, rowCtx);
+      const repaired = repairJsonResponse_(text, rowCtx);
       return parseModelJson_(repaired);
     } catch (err3) {
       return buildFallbackJson_(rowCtx, text);
@@ -751,7 +907,7 @@ function extractFirstJsonObject_(text) {
   return '';
 }
 
-function repairJsonResponse_(badText, originalPrompt, rowCtx) {
+function repairJsonResponse_(badText, rowCtx) {
   const apiKey = PropertiesService.getScriptProperties().getProperty('CLAUDE_API_KEY');
   const model = PropertiesService.getScriptProperties().getProperty('CLAUDE_MODEL') || DEFAULT_MODEL;
 
@@ -845,7 +1001,8 @@ function detectLanguage_(transcript) {
   const t = String(transcript || '').toLowerCase();
   const spanishHints = [
     'hola', 'gracias', 'por favor', 'buenos dias', 'buenas tardes', 'deuda', 'pago', 'cuenta',
-    'necesito', 'puede', 'habla espanol', 'español', 'usted'
+    'necesito', 'puede', 'habla espanol', 'español', 'usted', 'llamada', 'grabada', 'cobrador',
+    'intento de cobrar', 'fecha de nacimiento', 'últimos cuatro', 'seguro social', 'dirección'
   ];
 
   let count = 0;
@@ -858,36 +1015,89 @@ function detectLanguage_(transcript) {
 
 function isVoicemailTranscript_(transcript) {
   const t = String(transcript || '').toLowerCase();
-  return /voicemail|limited content message|please call us back|leave a message|beep|tone after the beep/.test(t);
+  return /voicemail|limited content message|please call us back|leave a message|beep|tone after the beep|buzón de voz|deje su mensaje|después del tono|por favor devuélvanos la llamada/.test(t);
 }
 
-function openingLooksCutOff_(transcript) {
-  const t = String(transcript || '').trim();
-  const start = t.slice(0, 250).toLowerCase();
+function detectAuthenticationSequence_(transcript) {
+  const t = String(transcript || '').toLowerCase();
 
-  if (!start) return false;
+  const nameRegex = /(first name|last name|full name|nombre|apellido|nombre completo)/i;
+  const ssnRegex = /(last four|last 4|ssn ending|social security ending|últimos cuatro|últimos 4|seguro social terminando)/i;
+  const dobRegex = /(date of birth|dob|birthday|fecha de nacimiento)/i;
+  const addressRegex = /(street address|mailing address|physical address|address on file|dirección física|dirección postal|dirección registrada|su dirección)/i;
 
-  if (/thank you for calling|this call will be recorded|my name is|january|debt collection agency|attempt to collect a debt/.test(start)) {
-    return false;
+  const nameMatch = t.search(nameRegex);
+  const ssnMatch = t.search(ssnRegex);
+  const dobMatch = t.search(dobRegex);
+  const addressMatch = t.search(addressRegex);
+
+  const piiPositions = [];
+  if (ssnMatch >= 0) piiPositions.push(ssnMatch);
+  if (dobMatch >= 0) piiPositions.push(dobMatch);
+  if (addressMatch >= 0) piiPositions.push(addressMatch);
+
+  const authSatisfied = nameMatch >= 0 && piiPositions.length >= 2;
+  let authEndIndex = -1;
+
+  if (authSatisfied) {
+    piiPositions.sort(function(a, b) { return a - b; });
+    authEndIndex = Math.max(nameMatch, piiPositions[1]);
   }
 
-  return true;
+  return {
+    authSatisfied: authSatisfied,
+    authEndIndex: authEndIndex
+  };
 }
 
-function buildScorecardRecord_(model, meta) {
-  return [
-    meta.uuid || '',
-    meta.firstName || '',
-    meta.agentUuid || '',
-    meta.direction || '',
-    meta.createdAt || '',
-    meta.clt || '',
-    meta.apPortal || '',
-    Number(meta.finalScore || 0),
-    meta.summary || '',
-    meta.errors || '',
-    ''
-  ];
+function detectEarlyRecordingDisclosure_(transcript) {
+  const t = String(transcript || '');
+  const earlySegment = t.slice(0, 1200);
+  return /(this call (may be )?recorded|call is recorded|this call is being recorded|esta llamada (puede ser )?grabada|la llamada está siendo grabada|esta llamada está siendo grabada)/i.test(earlySegment);
+}
+
+function detectMiniMirandaAfterAuthentication_(transcript, authEndIndex) {
+  const t = String(transcript || '');
+  if (authEndIndex < 0) return false;
+  const afterAuth = t.slice(authEndIndex);
+  return /(debt collector|debt collection|cobrador de deudas|cobranza de deudas)/i.test(afterAuth);
+}
+
+function detectSettlementDisclosure_(transcript) {
+  const t = String(transcript || '');
+
+  const automaticApprovalPattern = /(full negotiated payment amount|agreed timeframe|returned by your bank as unpaid|agreement will be void|new agreement must be reached|monto negociado completo|plazo acordado|devuelto por su banco como impago|el acuerdo quedará sin efecto|se debe llegar a un nuevo acuerdo)/i;
+  const approvalRequiredPatternA = /(if your request is approved|request is approved|si su solicitud es aprobada|si se aprueba su solicitud)/i;
+  const approvalRequiredPatternB = /(set up a payment within 30 days|payment within 30 days|programar un pago dentro de 30 días|pago dentro de 30 días)/i;
+  const approvalRequiredPatternC = /(full negotiated payment amount|agreed timeframe|returned by your bank as unpaid|agreement will be void|new agreement must be reached|monto negociado completo|plazo acordado|devuelto por su banco como impago|el acuerdo quedará sin efecto|se debe llegar a un nuevo acuerdo)/i;
+
+  const automaticApproval = automaticApprovalPattern.test(t);
+  const approvalRequired = approvalRequiredPatternA.test(t) && approvalRequiredPatternB.test(t) && approvalRequiredPatternC.test(t);
+
+  return automaticApproval || approvalRequired;
+}
+
+function detectBadgeNumberMention_(transcript) {
+  const t = String(transcript || '');
+  return /(badge( number)?\s*[:#]?\s*\d{1,4}|agent( number)?\s*[:#]?\s*\d{1,4}|my number is\s*\d{1,4}|mi número es\s*\d{1,4}|número de agente\s*[:#]?\s*\d{1,4}|identification number\s*[:#]?\s*\d{1,4})/i.test(t);
+}
+
+function detectTranscriptCutoff_(transcript) {
+  const t = String(transcript || '').toLowerCase();
+
+  if (/(call dropped|disconnected|line went dead|recording ended abruptly|audio cuts off|se cortó la llamada|se desconectó|la línea se cayó|grabación se corta)/i.test(t)) {
+    return true;
+  }
+
+  const trimmed = String(transcript || '').trim();
+  if (!trimmed) return false;
+
+  const tail = trimmed.slice(-120);
+  if (!/[.!?]"?\)?\s*$/.test(tail) && tail.length > 40) {
+    return true;
+  }
+
+  return false;
 }
 
 function createScorecards_(groups) {
@@ -909,11 +1119,30 @@ function createScorecards_(groups) {
     } catch (e) {}
 
     const sheet = ss.getSheets()[0];
-    const headers = ['UUID', 'FIRST_NAME', 'AGENT_UUID', 'DIRECTION', 'CREATED_AT', 'CLT', 'AP Portal', 'Final Score', 'Summary', 'Errors', 'Agent Comments'];
+
+    const headers = [
+      'UUID',
+      'FIRST_NAME',
+      'AGENT_UUID',
+      'DIRECTION',
+      'CREATED_AT',
+      'CLT',
+      'AP Portal',
+      'Final Score',
+      'Summary',
+      'Errors',
+      'Agent Comments'
+    ];
+
+    getUnifiedCriteriaList_().forEach(function(c) {
+      headers.push(`C${c.id} Verdict`);
+      headers.push(`C${c.id} Evidence`);
+    });
 
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
     sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
     sheet.setFrozenRows(1);
+
     if (sheet.getLastColumn() > 0) {
       sheet.autoResizeColumns(1, sheet.getLastColumn());
     }
@@ -995,6 +1224,49 @@ function normalizeDirection_(value) {
   return String(value || '').trim().toUpperCase();
 }
 
-function setProgress_(progress) {
-  PropertiesService.getDocumentProperties().setProperty(PROGRESS_KEY, JSON.stringify(progress));
+function createProgressState_() {
+  return {
+    lastWriteMs: 0,
+    lastProcessedWritten: -1
+  };
+}
+
+function shouldWriteProgress_(state, progress, force) {
+  if (force) return true;
+
+  const now = Date.now();
+  const processed = Number(progress.processed || 0);
+  const total = Number(progress.total || 0);
+
+  if (processed === 0 || processed === total) return true;
+  if (processed === state.lastProcessedWritten) return false;
+  if (processed % PROGRESS_WRITE_EVERY_N_ROWS !== 0) return false;
+  if ((now - state.lastWriteMs) < PROGRESS_WRITE_MIN_INTERVAL_MS) return false;
+
+  return true;
+}
+
+function setProgressThrottled_(state, progress) {
+  progress = progress || {};
+  const force = !!progress.force;
+
+  if (!shouldWriteProgress_(state, progress, force)) {
+    return;
+  }
+
+  const clean = {
+    status: progress.status || 'idle',
+    fileName: progress.fileName || '',
+    total: Number(progress.total || 0),
+    processed: Number(progress.processed || 0),
+    written: Number(progress.written || 0),
+    skipped: Number(progress.skipped || 0),
+    errors: Array.isArray(progress.errors) ? progress.errors : [],
+    message: String(progress.message || ''),
+    updatedAt: new Date().toISOString()
+  };
+
+  PropertiesService.getDocumentProperties().setProperty(PROGRESS_KEY, JSON.stringify(clean));
+  state.lastWriteMs = Date.now();
+  state.lastProcessedWritten = clean.processed;
 }
