@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        padding: 12px;
+      }
+
+      .row {
+        margin-bottom: 12px;
+      }
+
+      label {
+        display: block;
+        font-weight: 600;
+        margin-bottom: 4px;
+      }
+
+      input,
+      button {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px;
+      }
+
+      input[type="file"] {
+        padding: 4px 0;
+      }
+
+      button {
+        cursor: pointer;
+      }
+
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+
+      .muted {
+        color: #666;
+        font-size: 12px;
+        line-height: 1.4;
+      }
+
+      #status {
+        white-space: pre-wrap;
+        font-size: 12px;
+        background: #f6f6f6;
+        padding: 8px;
+        border: 1px solid #ddd;
+        min-height: 90px;
+      }
+
+      .progress-wrap {
+        width: 100%;
+        background: #eee;
+        border: 1px solid #ccc;
+        height: 18px;
+        border-radius: 10px;
+        overflow: hidden;
+        margin: 8px 0 12px;
+      }
+
+      .progress-bar {
+        height: 100%;
+        width: 0%;
+        background: #4a90e2;
+        transition: width 0.2s ease;
+      }
+
+      .stats {
+        font-size: 12px;
+        margin-bottom: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="row">
+      <label for="csvFile">Upload CSV</label>
+      <input id="csvFile" type="file" accept=".csv,text/csv" />
+      <div class="muted">
+        The CSV stays in browser memory and is sent directly when you run the evaluation.
+      </div>
+    </div>
+
+    <div class="row">
+      <button id="loadBtn" onclick="loadCsv()">Load CSV</button>
+    </div>
+
+    <div class="row">
+      <label for="outputSheetName">Output sheet name</label>
+      <input id="outputSheetName" value="QA Evaluations" />
+    </div>
+
+    <div class="row">
+      <label for="limit">Limit rows (optional)</label>
+      <input id="limit" type="number" min="0" value="0" placeholder="0 = all rows" />
+      <div class="muted">
+        Voicemail rows are skipped by the server logic.
+      </div>
+    </div>
+
+    <div class="row">
+      <button id="runBtn" onclick="runEval()" disabled>Run evaluation</button>
+    </div>
+
+    <div class="stats" id="stats">Ready.</div>
+    <div class="progress-wrap">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+    <div id="status">Load a CSV first.</div>
+
+    <script>
+      let pollTimer = null;
+      let uploadedFileName = '';
+      let uploadedBase64 = '';
+
+      function setStatus(message) {
+        document.getElementById('status').textContent =
+          typeof message === 'string' ? message : JSON.stringify(message, null, 2);
+      }
+
+      function setStats(progress) {
+        const percent = Number(progress && progress.percent ? progress.percent : 0);
+        document.getElementById('progressBar').style.width = percent + '%';
+
+        document.getElementById('stats').textContent =
+          'Status: ' + ((progress && progress.status) || 'idle') +
+          ' | Processed: ' + ((progress && progress.processed) || 0) + '/' + ((progress && progress.total) || 0) +
+          ' | Written: ' + ((progress && progress.written) || 0) +
+          ' | Skipped: ' + ((progress && progress.skipped) || 0);
+      }
+
+      function setButtonsLoading(isLoading) {
+        document.getElementById('loadBtn').disabled = isLoading;
+        document.getElementById('runBtn').disabled = isLoading || !uploadedBase64;
+        document.getElementById('csvFile').disabled = isLoading;
+      }
+
+      function getSelectedFile() {
+        const input = document.getElementById('csvFile');
+        if (!input.files || !input.files.length) {
+          throw new Error('Please choose a CSV file first.');
+        }
+        return input.files[0];
+      }
+
+      function fileToBase64(file) {
+        return new Promise(function(resolve, reject) {
+          const reader = new FileReader();
+
+          reader.onload = function(e) {
+            const result = e.target.result || '';
+            const parts = String(result).split(',');
+            if (parts.length < 2) {
+              reject(new Error('Failed to read file.'));
+              return;
+            }
+            resolve(parts[1]);
+          };
+
+          reader.onerror = function() {
+            reject(new Error('Failed to read file.'));
+          };
+
+          reader.readAsDataURL(file);
+        });
+      }
+
+      async function loadCsv() {
+        try {
+          const file = getSelectedFile();
+
+          if (!/\.csv$/i.test(file.name)) {
+            throw new Error('Please upload a .csv file.');
+          }
+
+          setButtonsLoading(true);
+          setStatus('Reading CSV into browser memory...');
+
+          uploadedFileName = file.name;
+          uploadedBase64 = await fileToBase64(file);
+
+          setStatus({
+            ok: true,
+            fileName: uploadedFileName,
+            message: 'CSV loaded in browser memory. Click Run evaluation to process it.'
+          });
+
+          document.getElementById('runBtn').disabled = false;
+        } catch (err) {
+          uploadedFileName = '';
+          uploadedBase64 = '';
+          document.getElementById('runBtn').disabled = true;
+          setStatus('Error: ' + err.message);
+        } finally {
+          setButtonsLoading(false);
+        }
+      }
+
+      function startPolling() {
+        stopPolling();
+
+        pollTimer = setInterval(function() {
+          google.script.run
+            .withSuccessHandler(function(progress) {
+              setStats(progress);
+              if (progress && progress.message) {
+                setStatus(progress);
+              }
+              if (progress && (progress.status === 'done' || progress.status === 'idle')) {
+                stopPolling();
+                setButtonsLoading(false);
+              }
+            })
+            .withFailureHandler(function(error) {
+              setStatus('Error: ' + error.message);
+              stopPolling();
+              setButtonsLoading(false);
+            })
+            .getProgress();
+        }, 1500);
+      }
+
+      function stopPolling() {
+        if (pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+      }
+
+      function runEval() {
+        if (!uploadedFileName || !uploadedBase64) {
+          setStatus('Error: Load a CSV first.');
+          return;
+        }
+
+        const payload = {
+          fileName: uploadedFileName,
+          base64Data: uploadedBase64,
+          outputSheetName: document.getElementById('outputSheetName').value.trim(),
+          limit: Number(document.getElementById('limit').value || 0)
+        };
+
+        setButtonsLoading(true);
+        setStatus('Running evaluation...');
+        setStats({
+          status: 'running',
+          processed: 0,
+          total: 0,
+          written: 0,
+          skipped: 0,
+          percent: 0
+        });
+
+        startPolling();
+
+        google.script.run
+          .withSuccessHandler(function(result) {
+            setStatus(result);
+            google.script.run
+              .withSuccessHandler(function(progress) {
+                setStats(progress);
+                stopPolling();
+                setButtonsLoading(false);
+              })
+              .withFailureHandler(function(error) {
+                setStatus('Error: ' + error.message);
+                stopPolling();
+                setButtonsLoading(false);
+              })
+              .getProgress();
+          })
+          .withFailureHandler(function(error) {
+            setStatus('Error: ' + error.message);
+            stopPolling();
+            setButtonsLoading(false);
+          })
+          .runEvaluations(payload);
+      }
+    </script>
+  </body>
+</html>
